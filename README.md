@@ -42,15 +42,16 @@ You can also just get a full calendar of all tasks (`tasks calendar`), get a gra
 ## Modifiers
 
 Available modifiers in tasks:
-  Time:      the amount of days a task will take.
-  Load:      the amount of resources that will be dedicated to a task (min: 0, max: 1, default: 1).
-  Progress:  the amount of days that have been dedicated to a task.
-  Priority:  the priority a task has.
-  By:        worker who will do the task.
-  Before:    list of tasks that need to be done before.
-  Deadline:  last date to perform the task.
-  Not until: date before which the task cannot be started.
-  On:        fixed date when the task will have to be done.
+
+* Time:      the amount of days a task will take.
+* Load:      the amount of resources that will be dedicated to a task (min: 0, max: 1, default: 1).
+* Progress:  the amount of days that have been dedicated to a task.
+* Priority:  the priority a task has.
+* By:        worker who will do the task.
+* Before:    list of tasks that need to be done before.
+* Deadline:  last date to perform the task.
+* Not until: date before which the task cannot be started.
+* On:        fixed date when the task will have to be done.
 
 ## Copyright
 

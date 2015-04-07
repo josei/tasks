@@ -1,0 +1,353 @@
+#!/usr/bin/ruby
+
+require 'date'
+#require 'ruby-debug'
+
+################################### HELPERS ####################################
+
+class Date
+  def humanize
+    weekdays = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']
+    months = ['', 'January', 'February', 'March', 'April', 'May', 'June',
+              'July', 'August', 'September', 'October', 'November', 'December']
+    "#{weekdays[self.wday]}, #{self.day} #{months[self.month]} #{self.year}"
+  end
+
+  def cnext
+    date = self
+    begin
+      date = date.next
+    end while [0,6].include? date.wday
+    date
+  end
+
+  def days_until(date)
+    (self..date).reject {|d| [0,6].include? d.wday }.size
+  end
+
+  def earlyness
+    1_000_000_000_000_000_000.0 / (self.year * 365 + self.month * 31 + self.day)
+  end
+end
+
+class String
+  def camelize(first_letter_in_uppercase = true)
+    if first_letter_in_uppercase
+      self.gsub(/\/(.?)/) { ":: " + $1.upcase }.gsub(/(^|_)(.)/) { " " + $2.upcase }.strip
+    end
+  end
+
+  def underscore
+    self.to_s.gsub(/::/, '/').
+      gsub(/([A-Z]+)([A-Z][a-z])/,'\1_\2').
+      gsub(/([a-z\d])([A-Z])/,'\1_\2').
+      tr("-", "_").
+      downcase.
+      gsub(" ", "_")
+  end
+
+  def humanize
+    temp = gsub('_', ' ')
+    temp = temp[0..0].upcase + temp[1..-1]
+    temp
+  end
+end
+
+################################################################################
+
+class Task
+  attr_accessor :state, :name, :notes, :worker, :before, :after, :time, :from, :until, :not_until,
+                :priority, :deadline, :warnings, :load_remaining
+  attr_reader   :progress, :load
+
+  def initialize
+    @state = :undone
+    @name = ""
+    @notes = []
+    @worker = Worker.new(:someone)
+    @before = []
+    @after = []
+    @progress = 0
+    @priority = 0
+    @time = 0
+    @load = @load_remaining = 1
+    @not_until = nil
+    @until = nil
+    @from = nil
+    @deadline = nil
+    @warnings = []
+  end
+
+  def doable?(state)
+    doable = true
+    @before.each { |t| doable = false if t.undone? }
+    doable = false if !@from.nil? and state.day < @from
+    doable = false if !@until.nil? and state.day > @until
+    doable = false if !@not_until.nil? and state.day < @not_until
+    doable = false if done?
+    doable = false if @load_remaining == 0
+    doable
+  end
+
+  def undone? ; !done?; end
+
+  def done? ; @state == :done; end
+
+  def to_s
+    "Task\n" +
+    "  name:      #{@name.to_s.humanize}\n" +
+    "  by:        #{@worker.name.to_s.camelize}\n" +
+    "  before:    #{@before.map{|t| t.name.to_s.humanize} * ", "}\n" +
+    "  time:      #{@time}\n" +
+    "  load:      #{@load}\n" +
+    "  min days:  #{min_time}\n" +
+    (@deadline.nil? ? "" : "  deadline:  #{@deadline.humanize}\n") +
+    (@from.nil? ? ""     : "  start on:  #{@from.humanize}\n") +
+    (@until.nil? ? ""    : "  finish on: #{@until.humanize}\n") +
+    "  status:    #{@state == :done ? "Finished" : "Unfinished"}\n" +
+    "  notes:     #{@notes.map{|n|"\n    - #{n}"}}\n"
+  end
+
+  def progress= p
+    @progress = p
+    @state = :done if @progress >= @time
+  end
+
+  def load= l
+    @load_remaining = @load = l
+  end
+
+  def remaining
+    @time - @progress
+  end
+
+  def immediate?
+    @time == 0
+  end
+
+  def event?
+    !@from.nil? or !@until.nil?
+  end
+
+  def min_time
+    remaining + (@before.map {|t| t.min_time }.max || 0)
+  end
+
+  def heuristic
+    remaining + @priority +
+    ( @deadline.nil?   ? 0 : @deadline.earlyness) +
+    ( @after.size == 0 ? 0 : @after.map{ |t| t.heuristic }.max )
+  end
+end
+
+class Worker
+  attr_accessor :name, :task_name, :effort, :scheduled
+
+  def initialize name
+    @name = name
+    @scheduled = nil
+    @effort = 1
+  end
+
+  def perform(task, state)
+    if (@effort > 0 or task.immediate?) and task.undone?
+      effort = [task.remaining, @effort, task.load].min
+      @effort       -= effort
+      task.progress += effort
+      task.load_remaining -= effort
+
+      task.warnings << "No time to finish \"#{task.name.to_s.humanize}\" on time" if !task.deadline.nil? and task.done? and task.deadline < state.day
+
+      state.calendar.last << task
+    end
+  end
+
+  def == obj
+    name == obj.name
+  end
+end
+
+# Represents the search state when searching for the shortest calendar
+class Plan
+  attr_accessor :today, :day, :calendar, :tasks, :workers
+
+  def initialize(tasks, workers, day=Date.today)
+    @day = @today = day
+    @calendar = [[]]
+    @tasks = tasks
+    @workers = workers
+  end
+
+  def days; calendar.size; end
+
+  def arrange
+    begin
+      raise Exception, "Possible infinite project. Tasks without end: #{@tasks.select {|t| t.undone?}.map {|t| t.name.to_s.humanize} * ", "}" if days > 1000
+
+      @workers.each do |worker|
+        worker_tasks = @tasks.select { |t| t.worker == worker and t.doable?(self) }
+
+        # Perform immediate tasks
+        worker_tasks.select { |t| t.immediate? }.each { |t| worker.perform t,self }
+
+        # Perform today's events
+        worker_tasks.select { |t| t.event? }.each { |t| worker.perform t,self }
+
+        # Perform scheduled task
+        scheduled_done = true
+        if !worker.scheduled.nil?
+          worker.perform worker.scheduled,self
+          scheduled_done = false if worker.scheduled.undone?
+        end
+
+        # Schedule next task if scheduled task is done
+        worker.scheduled = @tasks.select { |t| t.worker == worker and t.doable?(self) and t.time > 0 }.
+          sort_by { |t| -t.heuristic }.first if scheduled_done
+      end
+
+      next_day! if day_over?
+    end until done?
+    @calendar.pop if @calendar.last == []
+    self
+  end
+
+  def done?
+    @tasks.select { |t| t.undone? }.size == 0
+  end
+
+  def undone?
+    !done?
+  end
+
+  def day_over?
+    day_over = true; @workers.each { |w| day_over = false if @tasks.find { |t| t.worker == w and t.doable?(self) } and w.effort > 0}
+    day_over = false if @tasks.find { |t| t.immediate? and t.doable?(self) }
+    day_over
+  end
+
+  def next_day!
+    @day = @day.cnext
+    @calendar << []
+    @workers.each { |w| w.effort = 1}
+    @tasks.each { |t| t.load_remaining = t.load }
+  end
+
+  def to_s(limit = -1)
+    str = ""
+    str += "WARNING:\n  " + warnings * "\n  " + "\n" if warnings.size > 0
+    day = today
+    @calendar.each_with_index do |tasks, i|
+      str += "#{day.humanize}\n"
+      @workers.each do |w|
+        worker_tasks = tasks.select { |t| t.worker == w }
+        str += "  #{w.name.to_s.camelize} has to do:\n" if worker_tasks.size > 0 and @workers.size > 1
+        worker_tasks.each do |t|
+          str += "    #{t.name.to_s.humanize}\n"
+          t.notes.each { |n| str += "      - #{n}\n" }
+        end
+      end
+      return str if i + 1 == limit
+      day = day.cnext
+    end
+    str += "Total: #{days} days"
+  end
+
+  def warnings
+    tasks.inject([]) {|w, t| w+=t.warnings}
+  end
+end
+
+# Parse taskfile
+`touch Taskfile`
+tasks = open("Taskfile", "r").readlines.map{|l| l.strip.chomp}.reject{|l| l[0..0]=='#' }.select{|l| l!=""}.map do |line|
+  task = Task.new
+  task.state = :done if line[0..0].downcase == 'x' or line[0..0].downcase == 'o'
+  chunks = line[1..-1].split(/\.\Z|\. /)
+  task.name = chunks.shift.strip.underscore.to_sym
+  chunks.map { |c| c.strip }.select{|c| c!=""}.each do |chunk|
+    if chunk =~ /\ATiempo:/ or chunk =~ /\ATime:/
+      task.time = chunk.split(/:/).last.to_f
+    elsif chunk =~ /\ACarga:/ or chunk =~ /\ALoad:/
+      task.load = chunk.split(/:/).last.to_f
+      task.time = task.from.days_until(task.until) * task.load if task.event?
+    elsif chunk =~ /\AProgreso:/ or chunk =~ /\AProgress:/
+      task.progress = chunk.split(/:/).last.to_f
+    elsif chunk =~ /\APrioridad:/ or chunk =~ /\APriority:/
+      task.priority = chunk.split(/:/).last.to_i
+    elsif chunk =~ /\APor:/ or chunk =~ /\ABy:/
+      task.worker = Worker.new(chunk.split(/:/).last.strip.underscore.to_sym)
+    elsif chunk =~ /\AAntes:/ or chunk =~ /\ABefore:/
+      task.before = chunk.split(/:|,/)[1..-1].map{|t| t.strip.underscore.to_sym}
+    elsif chunk =~ /\APlazo:/ or chunk =~ /\ADeadline:/
+      task.deadline = Date.parse(chunk.split(/:/).last)
+    elsif chunk =~ /\ANo hasta:/ or chunk =~ /\ANot until:/
+      task.not_until = Date.parse(chunk.split(/:/).last)
+    elsif chunk =~ /\AEn:/ or chunk =~ /\AOn:/
+      if chunk.split(/:/).last =~ /(a|to)/
+        dates = chunk.split(/:/).last.match(/\A(.*)(a|to)(.*)\Z/).captures
+        task.from = Date.parse(dates.first)
+        task.until = Date.parse(dates.last)
+      else
+        task.from = task.until = Date.parse(chunk.split(/:/).last)
+      end
+      task.load = task.time if task.time != 0
+      task.time = task.from.days_until(task.until) * task.load
+    else
+      task.notes << chunk
+    end
+  end
+  task
+end
+tasks.each do |t|
+  t.before.map! do |name|
+    task = tasks.find { |b| b.name==name }
+    raise Exception, "Unknown task: '#{name.to_s.humanize}'" if task.nil?
+    task
+  end
+end
+tasks.each { |t| t.after = tasks.select { |task| task.before.include?(t) } }
+workers = tasks.map{|t| t.worker.name}.uniq.map { |name| Worker.new(name) }
+
+day = Date.today
+day = Date.parse($*[1]) if $*[1]
+if $*[0] == 'show'
+  tasks.sort_by { |t| -t.heuristic }.each { |t| puts t }
+elsif $*[0] == 'workers'
+  workers.each { |w| puts w.name.to_s.camelize; tasks.select{|t| t.worker==w and t.state==:undone}.each{|t| puts "  #{t.name.to_s.humanize}" } }
+elsif $*[0] == 'calendar'
+  puts Plan.new(tasks, workers, day).arrange
+elsif $*[0] == 'graph'
+  require 'rubygems'
+  require 'graphviz'
+  g = GraphViz::new( "G", :rankdir => "LR", :use=>'dot', :overlap=>'false' )
+  nodes = {}
+  tasks.each {|t| nodes[t.name] = g.add_node(t.name.to_s) }
+  tasks.each do |t|
+    t.before.each { |b| g.add_edge(nodes[b.name], nodes[t.name]) }
+  end
+  g.output( :output => "png", :file => "graph.png" )
+elsif $*[0] == 'today'
+  puts Plan.new(tasks, workers, day).arrange.to_s(1)
+elsif $*[0] == 'week'
+  puts Plan.new(tasks, workers, day).arrange.to_s(5)
+elsif $*[0] == 'month'
+  puts Plan.new(tasks, workers, day).arrange.to_s(22)
+elsif $*[0] == 'help'
+  puts 'Sample Taskfile:'
+  puts 'x Buy clothes. Just go to the city and buy trousers and shirts. Time: 0.5'
+  puts '- Buy food. Buy eggs, milk, and chocolate. Before: buy clothes. Time: 0.5'
+  puts '- Dentist. On: 2016/01/13. Time: 1'
+  puts
+  puts 'Available modifiers in tasks:'
+  puts '  Time:      the amount of days a task will take.'
+  puts '  Load:      the amount of resources that will be dedicated to a task (min: 0, max: 1, default: 1).'
+  puts '  Progress:  the amount of days that have been dedicated to a task.'
+  puts '  Priority:  the priority a task has.'
+  puts '  By:        worker who will do the task.'
+  puts '  Before:    list of tasks that need to be done before.'
+  puts '  Deadline:  last date to perform the task.'
+  puts '  Not until: date before which the task cannot be started.'
+  puts '  On:        fixed date when the task will have to be done.'
+else
+  puts "Usage: tasks (show | today | week | month | calendar | workers | graph | help) [today's date]"
+end
